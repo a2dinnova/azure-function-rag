@@ -9,33 +9,27 @@ app.http('convert', {
   handler: async (request, context) => {
     try {
       const contentType = request.headers.get('content-type') || '';
-      // Extreu el boundary del multipart
       const boundaryMatch = contentType.match(/boundary=([^;]+)/i);
       if (!boundaryMatch) throw new Error('Content-Type multipart sense boundary');
 
       const bodyBuffer = Buffer.from(await request.arrayBuffer());
       const parts = multipart.Parse(bodyBuffer, boundaryMatch[1]);
-
       const filePart = parts.find(p => p && p.filename);
       if (!filePart) throw new Error('No s’ha trobat cap fitxer al camp "file"');
 
-      // DOCX -> HTML
       const { value: html } = await mammoth.convertToHtml({ buffer: filePart.data });
 
-      // === Agrupació per títols h1..h6 amb cheerio ===
       const $ = cheerio.load(html);
-      const blocks = []; // chunks plans
-      const stack = [];  // pila de seccions {level,title,html}
+      const blocks = [];
+      const stack = [];
 
-      // ajunta nodes fins al següent heading
       const pushChunk = (pathArr, nodes) => {
         if (!nodes.length) return;
         const fragHtml = nodes.map(n => $.html(n)).join('');
-        const text = $(fragHtml).text().replace(/\s+\n/g, '\n').trim();
+        const text = $(fragHtml).text().replace(/\s+\n/g, '\n').trim().normalize('NFC');
         if (!text) return;
-
         blocks.push({
-          path: pathArr.map(x => x.title).join(' > '), // ex: "1. Polítiques... > 1.1 Avisos..."
+          path: pathArr.map(x => x.title).join(' > '),
           level: pathArr[pathArr.length - 1].level,
           title: pathArr[pathArr.length - 1].title,
           html: fragHtml,
@@ -43,42 +37,41 @@ app.http('convert', {
         });
       };
 
-      // Recorre tots els fills del body i va creant seccions
       let buffer = [];
       $('body').children().each((_, el) => {
         const tag = el.tagName?.toLowerCase();
         const m = tag?.match(/^h([1-6])$/);
         if (m) {
-          // Aboca el buffer a la secció actual (si n'hi ha)
           if (stack.length) pushChunk(stack, buffer), buffer = [];
-
           const level = parseInt(m[1], 10);
-          const title = $(el).text().trim();
-
-          // Puja/baixa en la jerarquia
+          const title = $(el).text().trim().normalize('NFC');
           while (stack.length && stack[stack.length - 1].level >= level) stack.pop();
           stack.push({ level, title });
         } else {
           buffer.push(el);
         }
       });
-      // aboca el que queda
       if (stack.length) pushChunk(stack, buffer);
 
+      const rawName = filePart.filename || 'documento.docx';
+      const safeName = Buffer.from(rawName, 'latin1').toString('utf8');
+
       return {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
         jsonBody: {
-          fileName: filePart.filename,
+          fileName: safeName,
           contentType: filePart.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-          chunks: blocks,       // llista plana per la teva base vectorial
+          chunks: blocks,
           headings: $('h1,h2,h3,h4,h5,h6').map((_, h) => ({
             level: h.tagName.toLowerCase(),
-            text: $(h).text().trim()
+            text: $(h).text().trim().normalize('NFC')
           })).get()
         }
       };
     } catch (err) {
       context.log.error(err);
-      return { status: 400, jsonBody: { error: err.message || 'Error processant el document.' } };
+      return { status: 400, headers: { 'content-type': 'application/json; charset=utf-8' }, jsonBody: { error: err.message || 'Error processant el document.' } };
     }
   }
 });
